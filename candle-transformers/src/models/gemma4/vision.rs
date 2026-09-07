@@ -36,7 +36,7 @@ impl Module for RmsNorm {
         let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
         x_normed
             .to_dtype(x_dtype)?
-            .broadcast_mul(&(&self.weight + 1.0)?)
+            .broadcast_mul(&self.weight)
     }
 }
 
@@ -182,14 +182,45 @@ impl PatchEmbedder {
     }
 }
 
+// GGUF/HF vision weights include activation bounds for quantization-aware training.
+#[derive(Debug, Clone)]
+struct ClippableLinear {
+    linear: Linear,
+    bounds: Option<[f32; 4]>,
+}
+
+impl ClippableLinear {
+    fn new(input: usize, output: usize, vb: VarBuilder) -> Result<Self> {
+        let names = ["input_min", "input_max", "output_min", "output_max"];
+        let bounds = if names.iter().any(|name| vb.contains_tensor(name)) {
+            let mut bounds = [0f32; 4];
+            for (index, name) in names.iter().enumerate() {
+                bounds[index] = vb.get(1, name)?.flatten_all()?.to_vec1::<f32>()?[0];
+            }
+            Some(bounds)
+        } else { None };
+        Ok(Self { linear: candle_nn::linear_no_bias(input, output, vb)?, bounds })
+    }
+}
+
+impl Module for ClippableLinear {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self.bounds {
+            Some([input_min, input_max, output_min, output_max]) =>
+                self.linear.forward(&xs.clamp(input_min, input_max)?)?.clamp(output_min, output_max),
+            None => self.linear.forward(xs),
+        }
+    }
+}
+
 // ── VisionAttention ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct VisionAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: ClippableLinear,
+    k_proj: ClippableLinear,
+    v_proj: ClippableLinear,
+    o_proj: ClippableLinear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     rms_norm_eps: f64,
@@ -205,13 +236,13 @@ impl VisionAttention {
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
         let q_proj =
-            candle_nn::linear_no_bias(cfg.hidden_size, num_heads * head_dim, vb.pp("q_proj"))?;
+            ClippableLinear::new(cfg.hidden_size, num_heads * head_dim, vb.pp("q_proj"))?;
         let k_proj =
-            candle_nn::linear_no_bias(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
+            ClippableLinear::new(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
         let v_proj =
-            candle_nn::linear_no_bias(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
+            ClippableLinear::new(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
         let o_proj =
-            candle_nn::linear_no_bias(num_heads * head_dim, cfg.hidden_size, vb.pp("o_proj"))?;
+            ClippableLinear::new(num_heads * head_dim, cfg.hidden_size, vb.pp("o_proj"))?;
         let q_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
         Ok(Self {
@@ -276,20 +307,20 @@ impl VisionAttention {
 
 #[derive(Debug, Clone)]
 struct VisionMlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: ClippableLinear,
+    up_proj: ClippableLinear,
+    down_proj: ClippableLinear,
     act: Activation,
 }
 
 impl VisionMlp {
     fn new(cfg: &Gemma4VisionConfig, vb: VarBuilder) -> Result<Self> {
         let gate_proj =
-            candle_nn::linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"))?;
+            ClippableLinear::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"))?;
         let up_proj =
-            candle_nn::linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?;
+            ClippableLinear::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?;
         let down_proj =
-            candle_nn::linear_no_bias(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?;
+            ClippableLinear::new(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -548,5 +579,33 @@ impl VisionTower {
         }
 
         hidden_states.unsqueeze(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn gemma4_norm_uses_weight_without_gemma3_offset() -> Result<()> {
+        let norm = RmsNorm { weight: Tensor::new(&[2f32, 3.], &Device::Cpu)?, eps: 0. };
+        let result = norm.forward(&Tensor::new(&[[1f32, 1.]], &Device::Cpu)?)?.to_vec2::<f32>()?;
+        assert_eq!(result, vec![vec![2., 3.]]);
+        Ok(())
+    }
+
+    #[test]
+    fn vision_linear_applies_input_and_output_bounds() -> Result<()> {
+        let device = &Device::Cpu;
+        let mut weights = HashMap::new();
+        weights.insert("weight".to_owned(), Tensor::new(&[[2f32]], device)?);
+        for (name, value) in [("input_min", -1.), ("input_max", 1.), ("output_min", -1.5), ("output_max", 1.5)] {
+            weights.insert(name.to_owned(), Tensor::new(&[value as f32], device)?);
+        }
+        let linear = ClippableLinear::new(1, 1, VarBuilder::from_tensors(weights, DType::F32, device))?;
+        let output = linear.forward(&Tensor::new(&[[-10f32], [0.25], [10.]], device)?)?.to_vec2::<f32>()?;
+        assert_eq!(output, vec![vec![-1.5], vec![0.5], vec![1.5]]);
+        Ok(())
     }
 }
