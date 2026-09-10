@@ -14,15 +14,44 @@
 //!   - Q-norm and K-norm per head
 //! - Feed-forward: SwiGLU MLP across all layers
 
-use super::quantized_qwen3::Gguf;
 use super::with_tracing::QMatMul;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
-use candle::quantized::gguf_file;
+use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Module, Result, Tensor};
 use candle_nn::kv_cache::ConcatKvCache;
 use candle_nn::{Activation, Embedding};
 use std::io::{Read, Seek};
 use std::sync::Arc;
+
+pub struct Gguf<'a, R: Read + Seek> {
+    pub ct: &'a gguf_file::Content,
+    pub reader: &'a mut R,
+    pub device: Device,
+}
+
+impl<'a, R: Read + Seek> Gguf<'a, R> {
+    pub fn new(ct: &'a gguf_file::Content, reader: &'a mut R, device: Device) -> Self {
+        Self { ct, reader, device }
+    }
+
+    pub fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
+        let ws = self.ct.tensor(self.reader, name, &self.device)?;
+        QMatMul::from_weights(ws.into())
+    }
+
+    pub fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
+        let ws = self.ct.tensor(self.reader, name, &self.device)?;
+        RmsNorm::from_qtensor(ws, eps)
+    }
+
+    pub fn metadata(&self) -> &std::collections::HashMap<String, gguf_file::Value> {
+        &self.ct.metadata
+    }
+
+    pub fn tensor(&mut self, name: &str) -> Result<QTensor> {
+        self.ct.tensor(self.reader, name, &self.device)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -45,8 +74,8 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_gguf<R: Read + Seek>(gg: &Gguf<R>) -> Result<Self> {
-        let md_get = |s: &str| match gg.metadata().get(s) {
+    pub fn from_metadata(metadata: &std::collections::HashMap<String, gguf_file::Value>) -> Result<Self> {
+        let md_get = |s: &str| match metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
         };
@@ -120,6 +149,14 @@ impl Config {
             ssm_time_step_rank,
             ssm_inner_size,
         })
+    }
+
+    pub fn from_content(content: &gguf_file::Content) -> Result<Self> {
+        Self::from_metadata(&content.metadata)
+    }
+
+    pub fn from_gguf<'a, R: Read + Seek>(gg: &Gguf<'a, R>) -> Result<Self> {
+        Self::from_metadata(gg.metadata())
     }
 }
 
@@ -644,7 +681,7 @@ pub struct ModelWeights {
 
 impl ModelWeights {
     pub fn from_gguf<R: Read + Seek>(
-        ct: gguf_file::Content,
+        ct: &gguf_file::Content,
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
