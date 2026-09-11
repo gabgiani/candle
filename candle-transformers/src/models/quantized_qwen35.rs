@@ -85,6 +85,11 @@ impl Config {
         }
 
         let block_count = md_get("qwen35.block_count")?.to_u32()? as usize;
+        let nextn_layers = md_get("qwen35.nextn_predict_layers")
+            .and_then(|v| v.to_u32())
+            .map(|v| v as usize)
+            .unwrap_or(0);
+        let block_count = block_count.saturating_sub(nextn_layers);
         let embedding_length = md_get("qwen35.embedding_length")?.to_u32()? as usize;
         let feed_forward_length = md_get("qwen35.feed_forward_length")?.to_u32()? as usize;
         let context_length = md_get("qwen35.context_length")?.to_u32()? as usize;
@@ -259,9 +264,12 @@ pub struct AttentionWeights {
     k_norm: RmsNorm,
     num_heads: usize,
     num_kv_heads: usize,
+    num_v_heads: usize,
     num_kv_groups: usize,
+    num_v_groups: usize,
     head_dim: usize,
-    hidden_size: usize,
+    value_head_dim: usize,
+    output_dim: usize,
     rotary_emb: Arc<PartialRotaryEmbedding>,
     kv_cache: ConcatKvCache,
 }
@@ -273,11 +281,68 @@ impl AttentionWeights {
         rotary_emb: Arc<PartialRotaryEmbedding>,
         prefix: &str,
     ) -> Result<Self> {
-        let num_heads = cfg.head_count;
-        let num_kv_heads = cfg.head_count_kv;
         let head_dim = cfg.head_dim;
+        let projection_output_dim = |name: String| -> Result<usize> {
+            let Some(info) = gg.ct.tensor_infos.get(&name) else {
+                candle::bail!("cannot find tensor info for {name}");
+            };
+            let Some(&dim) = info.shape.dims().first() else {
+                candle::bail!("tensor {name} has no dimensions");
+            };
+            Ok(dim)
+        };
+        let projection_input_dim = |name: String| -> Result<usize> {
+            let Some(info) = gg.ct.tensor_infos.get(&name) else {
+                candle::bail!("cannot find tensor info for {name}");
+            };
+            let Some(&dim) = info.shape.dims().get(1) else {
+                candle::bail!("tensor {name} does not have an input dimension");
+            };
+            Ok(dim)
+        };
+        let q_projection_dim = projection_output_dim(format!("{prefix}.attn_q.weight"))?;
+        let k_projection_dim = projection_output_dim(format!("{prefix}.attn_k.weight"))?;
+        let v_projection_dim = projection_output_dim(format!("{prefix}.attn_v.weight"))?;
+        let output_dim = projection_input_dim(format!("{prefix}.attn_output.weight"))?;
+        if q_projection_dim % 2 != 0 {
+            candle::bail!(
+                "invalid full-attention Q/gate projection dimension for {prefix}: q_and_gate={q_projection_dim}"
+            );
+        }
+        let query_dim = q_projection_dim / 2;
+        if query_dim % head_dim != 0
+            || k_projection_dim % head_dim != 0
+        {
+            candle::bail!(
+                "invalid full-attention Q/K projection dimensions for {prefix}: q={query_dim}, k={k_projection_dim}, head_dim={head_dim}"
+            );
+        }
+        if output_dim != query_dim {
+            candle::bail!(
+                "invalid full-attention output dimension for {prefix}: output={output_dim}, q={query_dim}"
+            );
+        }
+        let num_heads = query_dim / head_dim;
+        let num_kv_heads = k_projection_dim / head_dim;
+        if num_heads == 0 || num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+            candle::bail!(
+                "invalid full-attention head counts for {prefix}: q={num_heads}, kv={num_kv_heads}"
+            );
+        }
         let num_kv_groups = num_heads / num_kv_heads;
-        let hidden_size = num_heads * head_dim;
+        let value_head_dim = output_dim / num_heads;
+        if value_head_dim == 0 || v_projection_dim % value_head_dim != 0 {
+            candle::bail!(
+                "invalid full-attention value projection dimensions for {prefix}: v={v_projection_dim}, output={output_dim}, q_heads={num_heads}"
+            );
+        }
+        let num_v_heads = v_projection_dim / value_head_dim;
+        if num_v_heads == 0 || num_heads % num_v_heads != 0 {
+            candle::bail!(
+                "invalid full-attention value head count for {prefix}: q={num_heads}, v={num_v_heads}"
+            );
+        }
+        let num_v_groups = num_heads / num_v_heads;
 
         let q_proj = gg.qmatmul(&format!("{prefix}.attn_q.weight"))?;
         let k_proj = gg.qmatmul(&format!("{prefix}.attn_k.weight"))?;
@@ -297,9 +362,12 @@ impl AttentionWeights {
             k_norm,
             num_heads,
             num_kv_heads,
+            num_v_heads,
             num_kv_groups,
+            num_v_groups,
             head_dim,
-            hidden_size,
+            value_head_dim,
+            output_dim,
             rotary_emb,
             kv_cache,
         })
@@ -307,18 +375,15 @@ impl AttentionWeights {
 
     pub fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let (b, l, _) = x.dims3()?;
-        let q = self.q_proj.forward(x)?;
+        let q_and_gate = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
-
-        let q = q
-            .reshape((b, l, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        let (q, gate) = split_query_gate(&q_and_gate, self.num_heads, self.head_dim)?;
         let k = k
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
         let v = v
-            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .reshape((b, l, self.num_v_heads, self.value_head_dim))?
             .transpose(1, 2)?;
 
         // Per-head Q/K norm
@@ -331,7 +396,7 @@ impl AttentionWeights {
         let (k, v) = self.kv_cache.append(&k, &v)?;
 
         let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-        let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+    let v = repeat_kv(v, self.num_v_groups)?.contiguous()?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
@@ -348,7 +413,8 @@ impl AttentionWeights {
         let context = probs
             .matmul(&v)?
             .transpose(1, 2)?
-            .reshape((b, l, self.hidden_size))?;
+            .reshape((b, l, self.output_dim))?;
+        let context = (context * candle_nn::ops::sigmoid(&gate)?)?;
         self.o_proj.forward(&context)
     }
 
@@ -509,25 +575,25 @@ impl LinearAttentionWeights {
 
         // L2 normalization of Q and K across head_dim
         let q_norm = (q.sqr()?.sum_keepdim(3)? + 1e-6)?.sqrt()?;
-        let q = (q / q_norm)?;
+        let q = q.broadcast_div(&q_norm)?;
         let k_norm = (k.sqr()?.sum_keepdim(3)? + 1e-6)?.sqrt()?;
-        let k = (k / k_norm)?;
+        let k = k.broadcast_div(&k_norm)?;
 
-        // Expand Q and K from 16 heads to 48 heads (Grouped Value Attention: 48 / 16 = 3)
         let v_per_k = self.num_v_heads / self.num_k_heads; // 3
-        let q = q.transpose(1, 2)?; // [b, 16, l, 128]
-        let k = k.transpose(1, 2)?; // [b, 16, l, 128]
-        let q = repeat_kv(q, v_per_k)?.transpose(1, 2)?; // [b, l, 48, 128]
-        let k = repeat_kv(k, v_per_k)?.transpose(1, 2)?; // [b, l, 48, 128]
+        let q = tile_gguf_key_heads(&q, v_per_k)?;
+        let k = tile_gguf_key_heads(&k, v_per_k)?;
 
         // 4. Decay and Beta parameters
         let x_f32 = x.to_dtype(DType::F32)?;
         // alpha = x @ ssm_alpha^T -> [b, l, 48]
         let alpha = x_f32.matmul(&self.ssm_alpha.t()?.unsqueeze(0)?)?;
         let dt = alpha.broadcast_add(&self.ssm_dt_bias)?;
-        let dt_softplus = (dt.exp()? + 1.0)?.log()?;
-        let a_decay = self.ssm_a.exp()?.neg()?;
-        let decay = dt_softplus.broadcast_mul(&a_decay)?.exp()?; // [b, l, 48]
+        let abs_dt = dt.abs()?;
+        let neg_abs_dt = abs_dt.neg()?;
+        let log1p = (neg_abs_dt.exp()? + 1.0)?.log()?;
+        let dt_softplus = (dt.maximum(&Tensor::zeros_like(&dt)?)? + log1p)?;
+        let g = dt_softplus.broadcast_mul(&self.ssm_a)?;
+        let decay = g.exp()?; // [b, l, 48]
 
         // beta = sigmoid(x @ ssm_beta^T) -> [b, l, 48]
         let beta = candle_nn::ops::sigmoid(&x_f32.matmul(&self.ssm_beta.t()?.unsqueeze(0)?)?)?;
@@ -557,20 +623,10 @@ impl LinearAttentionWeights {
                 .squeeze(1)?
                 .unsqueeze(2)?; // [b, 48, 1]
 
-            // v_pred = k_t @ S -> [b, 48, 128]
-            let k_unsqueezed = k_t.unsqueeze(2)?; // [b, 48, 1, 128]
-            let v_pred = k_unsqueezed.matmul(&cur_state)?.squeeze(2)?; // [b, 48, 128]
-
-            // v_err = beta_t * (v_t - v_pred)
-            let v_err = ((v_t - v_pred)? * beta_t)?; // [b, 48, 128]
-
-            // S_t = decay * S_{t-1} + k_t^T @ v_err
-            let update = k_t.unsqueeze(3)?.matmul(&v_err.unsqueeze(2)?)?; // [b, 48, 128, 128]
-            cur_state = (cur_state.broadcast_mul(&decay_t)? + update)?;
-
-            // y_t = q_t @ S_t -> [b, 48, 128]
-            let q_unsqueezed = q_t.unsqueeze(2)?; // [b, 48, 1, 128]
-            let y_t = q_unsqueezed.matmul(&cur_state)?.squeeze(2)?; // [b, 48, 128]
+            let (y_t, next_state) = gated_delta_step(
+                &q_t, &k_t, &v_t, &decay_t, &beta_t, &cur_state,
+            )?;
+            cur_state = next_state;
             step_outputs.push(y_t.to_dtype(x.dtype())?);
         }
 
@@ -596,6 +652,37 @@ impl LinearAttentionWeights {
         self.conv_state = None;
         self.recurrent_state = None;
     }
+}
+
+fn split_query_gate(projected: &Tensor, heads: usize, head_dim: usize) -> Result<(Tensor, Tensor)> {
+    let (batch, sequence, _) = projected.dims3()?;
+    let projected = projected.reshape((batch, sequence, heads, 2 * head_dim))?;
+    let query = projected.narrow(3, 0, head_dim)?.transpose(1, 2)?;
+    let gate = projected
+        .narrow(3, head_dim, head_dim)?
+        .reshape((batch, sequence, heads * head_dim))?;
+    Ok((query, gate))
+}
+
+fn tile_gguf_key_heads(hidden: &Tensor, repetitions: usize) -> Result<Tensor> {
+    Tensor::cat(&vec![hidden; repetitions], 2)
+}
+
+fn gated_delta_step(
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    decay: &Tensor,
+    beta: &Tensor,
+    state: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let state = state.broadcast_mul(decay)?;
+    let predicted = key.unsqueeze(2)?.matmul(&state)?.squeeze(2)?;
+    let delta = (value - predicted)?.broadcast_mul(beta)?;
+    let state = (state + key.unsqueeze(3)?.matmul(&delta.unsqueeze(2)?)?)?;
+    let query = (query / (query.dim(2)? as f64).sqrt())?;
+    let output = query.unsqueeze(2)?.matmul(&state)?.squeeze(2)?;
+    Ok((output, state))
 }
 
 #[derive(Debug, Clone)]
@@ -630,7 +717,10 @@ impl LayerWeights {
         };
         let mlp = MlpWeights::new(gg, &prefix)?;
 
-        let is_full_attn = (layer_idx + 1) % cfg.full_attention_interval == 0;
+        let is_full_attn = !gg
+            .ct
+            .tensor_infos
+            .contains_key(&format!("{prefix}.attn_qkv.weight"));
         if is_full_attn {
             let attn = AttentionWeights::new(gg, cfg, rotary, &prefix)?;
             Ok(Self::FullAttention { ln1, attn, ln2, mlp })
@@ -666,6 +756,65 @@ impl LayerWeights {
             Self::FullAttention { attn, .. } => attn.clear_kv_cache(),
             Self::LinearAttention { attn, .. } => attn.clear_state(),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum LayerState {
+    FullAttention(ConcatKvCache),
+    LinearAttention {
+        convolution: Option<Tensor>,
+        recurrent: Option<Tensor>,
+    },
+}
+
+impl LayerState {
+    pub fn to_device(&self, device: &Device) -> Result<Self> {
+        let transfer = |tensor: &Tensor| tensor.detach().to_device(device);
+        Ok(match self {
+            Self::FullAttention(cache) => {
+                let mut cache = cache.clone();
+                if let Some(key) = cache.k_mut() {
+                    *key = transfer(key)?;
+                }
+                if let Some(value) = cache.v_mut() {
+                    *value = transfer(value)?;
+                }
+                Self::FullAttention(cache)
+            }
+            Self::LinearAttention { convolution, recurrent } => Self::LinearAttention {
+                convolution: convolution.as_ref().map(transfer).transpose()?,
+                recurrent: recurrent.as_ref().map(transfer).transpose()?,
+            },
+        })
+    }
+}
+
+impl LayerWeights {
+    pub fn take_state(&mut self) -> LayerState {
+        match self {
+            Self::FullAttention { attn, .. } => LayerState::FullAttention(
+                std::mem::replace(&mut attn.kv_cache, ConcatKvCache::new(2)),
+            ),
+            Self::LinearAttention { attn, .. } => LayerState::LinearAttention {
+                convolution: attn.conv_state.take(),
+                recurrent: attn.recurrent_state.take(),
+            },
+        }
+    }
+
+    pub fn restore_state(&mut self, state: LayerState) -> Result<()> {
+        match (self, state) {
+            (Self::FullAttention { attn, .. }, LayerState::FullAttention(cache)) => {
+                attn.kv_cache = cache;
+            }
+            (Self::LinearAttention { attn, .. }, LayerState::LinearAttention { convolution, recurrent }) => {
+                attn.conv_state = convolution;
+                attn.recurrent_state = recurrent;
+            }
+            _ => candle::bail!("Qwen3.5 cache type does not match layer type"),
+        }
+        Ok(())
     }
 }
 
@@ -729,7 +878,13 @@ impl ModelWeights {
         let mut hidden = self.embed_tokens.forward(input_ids)?;
 
         let mask = if seq_len > 1 {
-            Some(crate::utils::build_causal_mask(seq_len, offset, &self.device)?)
+            Some(crate::utils::build_additive_causal_mask(
+                seq_len,
+                offset,
+                None,
+                &self.device,
+                hidden.dtype(),
+            )?)
         } else {
             None
         };
@@ -757,6 +912,70 @@ impl ModelWeights {
 mod tests {
     use super::*;
     use candle::{DType, Device, Tensor};
+
+    #[test]
+    fn offloaded_state_preserves_kv_and_recurrence() -> Result<()> {
+        let tensor = Tensor::from_vec(vec![1_f32, 2., 3., 4.], (1, 1, 2, 2), &Device::Cpu)?;
+        let mut cache = ConcatKvCache::new(2);
+        cache.append(&tensor, &tensor)?;
+        let LayerState::FullAttention(mut restored) = LayerState::FullAttention(cache).to_device(&Device::Cpu)? else {
+            panic!("wrong cache type");
+        };
+        restored.append(&tensor, &tensor)?;
+        assert_eq!(restored.current_seq_len(), 4);
+        assert_eq!(restored.k().unwrap().flatten_all()?.to_vec1::<f32>()?, vec![1., 2., 3., 4., 1., 2., 3., 4.]);
+        let state = LayerState::LinearAttention {
+            convolution: Some(tensor.clone()),
+            recurrent: Some(tensor),
+        }.to_device(&Device::Cpu)?;
+        let LayerState::LinearAttention { convolution, recurrent } = state else {
+            panic!("wrong cache type");
+        };
+        assert_eq!(convolution.unwrap().flatten_all()?.to_vec1::<f32>()?, vec![1., 2., 3., 4.]);
+        assert_eq!(recurrent.unwrap().flatten_all()?.to_vec1::<f32>()?, vec![1., 2., 3., 4.]);
+        Ok(())
+    }
+
+    #[test]
+    fn query_gate_is_split_within_each_head() -> Result<()> {
+        let projected = Tensor::from_vec(
+            vec![1_f32, 2., 10., 20., 3., 4., 30., 40.],
+            (1, 1, 8),
+            &Device::Cpu,
+        )?;
+        let (query, gate) = split_query_gate(&projected, 2, 2)?;
+        assert_eq!(query.dims(), &[1, 2, 1, 2]);
+        assert_eq!(query.flatten_all()?.to_vec1::<f32>()?, vec![1., 2., 3., 4.]);
+        assert_eq!(gate.flatten_all()?.to_vec1::<f32>()?, vec![10., 20., 30., 40.]);
+        Ok(())
+    }
+
+    #[test]
+    fn gguf_value_heads_use_tiled_key_order() -> Result<()> {
+        let hidden = Tensor::from_vec(vec![1_f32, 2.], (1, 1, 2, 1), &Device::Cpu)?;
+        let tiled = tile_gguf_key_heads(&hidden, 3)?;
+        assert_eq!(tiled.dims(), &[1, 1, 6, 1]);
+        assert_eq!(tiled.flatten_all()?.to_vec1::<f32>()?, vec![1., 2., 1., 2., 1., 2.]);
+        Ok(())
+    }
+
+    #[test]
+    fn gated_delta_decays_before_prediction_and_scales_query() -> Result<()> {
+        let device = Device::Cpu;
+        let query = Tensor::from_vec(vec![2_f32, 0.], (1, 1, 2), &device)?;
+        let key = Tensor::from_vec(vec![1_f32, 0.], (1, 1, 2), &device)?;
+        let value = Tensor::from_vec(vec![10_f32, 20.], (1, 1, 2), &device)?;
+        let state = Tensor::from_vec(vec![2_f32, 4., 6., 8.], (1, 1, 2, 2), &device)?;
+        let decay = Tensor::full(0.5_f32, (1, 1, 1, 1), &device)?;
+        let beta = Tensor::full(0.25_f32, (1, 1, 1), &device)?;
+        let (output, state) = gated_delta_step(&query, &key, &value, &decay, &beta, &state)?;
+        assert_eq!(state.flatten_all()?.to_vec1::<f32>()?, vec![3.25, 6.5, 3., 4.]);
+        let output = output.flatten_all()?.to_vec1::<f32>()?;
+        for (actual, expected) in output.iter().zip([3.25 * 2_f32.sqrt(), 6.5 * 2_f32.sqrt()]) {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_partial_rotary_embedding() -> Result<()> {

@@ -14,6 +14,30 @@ and ease of use. Try our online demos:
 [Segment
 Anything](https://huggingface.co/spaces/radames/candle-segment-anything-wasm).
 
+## DAFO fork: quantized Qwen and paging state
+
+This repository's `feature/quantized-qwen35-ssm` branch contains the Candle
+changes used by [DAFO Swarm](https://github.com/gabgiani/swarm-node/tree/feature/zero-config-network).
+It is a downstream fork, not an upstream Candle release.
+
+The September 11, 2026 milestone validated the `Qwen3.8-27B-Q4_0.gguf`
+artifact through its `qwen35` GGUF architecture, including correct text and
+EOS in distributed resident and disk-paged inference. Changes include:
+
+- Correct hybrid attention math and GGUF head layouts in
+  [`quantized_qwen35.rs`](candle-transformers/src/models/quantized_qwen35.rs).
+- Explicit `qwen35` GGUF pre-tokenization, matching the reference regex/NFC
+  pipeline without injected prefix spaces.
+- `LayerState`, `take_state`, `restore_state` and device transfer of inference
+  state so weights can be unloaded without losing KV, convolution or recurrent
+  caches. This is not a change to model quantization or training.
+
+The page scheduler, disk reads, per-request lifecycle and network worker are
+implemented in **swarm-node**, not in this library. Earlier Gemma 4 additions
+remain part of this fork. See [CHANGELOG.md](CHANGELOG.md#dafo-fork-milestone---2026-09-11)
+for the corrections and tests, and the swarm README for measured memory, latency
+and the currently supported paging scope.
+
 ## Get started
 
 Make sure that you have [`candle-core`](https://github.com/huggingface/candle/tree/main/candle-core) correctly installed as described in [**Installation**](https://huggingface.github.io/candle/guide/installation.html).

@@ -1,6 +1,50 @@
 # Changelog
 This documents the main changes to the `candle` crate.
 
+## DAFO fork milestone - 2026-09-11
+
+Downstream changes on `feature/quantized-qwen35-ssm`, building on the Gemma 4
+fork. This is not an upstream Candle version announcement.
+
+### Quantized Qwen3.5/3.8 correctness
+
+- Interpret `qwen35.nextn_predict_layers` separately from backbone layers; the
+  tested Qwen3.8-27B artifact has 64 backbone layers and one auxiliary MTP block.
+- Use additive causal masking rather than adding a binary mask to scores.
+- Split the full-attention query and output gate **within each head**, not as
+  two global halves of the projected tensor.
+- Tile linear-attention Q/K heads to match the GGUF value-head ordering.
+- Treat GGUF SSM `a` as the already-transformed negative decay coefficient;
+  avoid exponentiating it a second time, and compute softplus stably.
+- Apply recurrent-state decay before predicting the value/delta and scale the
+  query by the inverse square root of its head dimension.
+- Register `tokenizer.ggml.pre = qwen35` with the reference Unicode regex,
+  NFC normalization and no ByteLevel prefix-space injection. Existing Qwen2
+  and Llama3 tokenizer split tests continue to pass.
+
+### State transfer for weight paging
+
+- Add `LayerState` for full-attention KV state and linear-attention convolution
+  and recurrent state, with transfer between devices.
+- Add `LayerWeights::take_state` / `restore_state`, allowing callers to release
+  layer weights, then restore inference state after reloading those weights.
+- Reject mismatched cache/layer variants explicitly.
+
+### Validation and responsibility boundary
+
+Five focused Qwen tests cover per-head query/gate layout, tiled head order,
+recurrent decay/query scaling, state transfer and the existing rotary check.
+Two existing tokenizer split tests cover regression behavior. Swarm-node adds
+real-GGUF tokenizer parity, resident/paged activation parity across tokens,
+release/replay, cancellation/restart and a full-model two-paged-halves `OK`/EOS
+check. Its two-device M4 + RTX 3060 Laptop deployment produced exact `OK` and
+`one two three` replies with normal EOS termination.
+
+Those smoke tests establish the tested quantized execution path, not model
+quality or parity for every architecture, context, dtype or accelerator. The
+disk pager and responsive network worker are supplied by swarm-node; this
+fork supplies the model computation and movable state.
+
 ## v0.3.1 - Unreleased
 
 ### Added

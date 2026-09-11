@@ -107,9 +107,19 @@ fn pre_tokenizer_sequence(regex: &str, byte_level: ByteLevelPre) -> Result<PreTo
 
 fn pipeline_from_pre(pre: &str) -> Result<Pipeline> {
     const REGEX_QWEN2: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    const REGEX_QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
     const REGEX_LLAMA3: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
     Ok(match pre {
+        "qwen35" => Pipeline {
+            normalizer: Some(NFC.into()),
+            pretokenizer: Some(pre_tokenizer_sequence(
+                REGEX_QWEN35,
+                ByteLevelPre::new(false, false, false),
+            )?),
+            decoder: Some(ByteLevelDecoder::new(false, false, false).into()),
+            post_processor: Some(ByteLevelProcessor::new(false, false, false).into()),
+        },
         // Matches Qwen2 tokenizer.json settings
         "qwen2" => Pipeline {
             normalizer: Some(NFC.into()),
