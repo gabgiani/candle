@@ -287,20 +287,22 @@ impl VisionAttention {
         let k = k.contiguous()?;
         let v = v.contiguous()?;
 
-        // GQA
-        let k = crate::utils::repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-        let v = crate::utils::repeat_kv(v, self.num_kv_groups)?.contiguous()?;
-
-        // Scaled dot-product attention (scale = 1.0 since Q is already normalized)
-        let attn_weights = q.matmul(&k.transpose(2, 3)?)?;
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
+        let attn_output = vision_attention(&q, &k, &v, self.num_kv_groups)?;
 
         attn_output
             .transpose(1, 2)?
             .reshape((b_sz, seq_len, self.num_heads * self.head_dim))?
             .apply(&self.o_proj)
     }
+}
+
+fn vision_attention(query: &Tensor, key: &Tensor, value: &Tensor, groups: usize) -> Result<Tensor> {
+    if query.device().is_metal() {
+        return candle_nn::ops::sdpa(query, key, value, None, false, 1.0, 1.0);
+    }
+    let key = crate::utils::repeat_kv(key.clone(), groups)?.contiguous()?;
+    let value = crate::utils::repeat_kv(value.clone(), groups)?.contiguous()?;
+    candle_nn::ops::softmax_last_dim(&query.matmul(&key.transpose(2, 3)?)?)?.matmul(&value)
 }
 
 // ── VisionMlp ───────────────────────────────────────────────────────────────
@@ -586,6 +588,24 @@ impl VisionTower {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_vision_attention_matches_cpu() -> Result<()> {
+        let metal = Device::new_metal(0)?;
+        for width in [64, 72] {
+            let query = (Tensor::arange(0f32, (2 * 81 * width) as f32, &Device::Cpu)? * 0.001)?
+                .sin()?.reshape((1, 2, 81, width))?;
+            let key = (&query * 0.7)?.cos()?;
+            let value = (&query * 0.3)?.sin()?;
+            let expected = vision_attention(&query, &key, &value, 1)?;
+            let actual = vision_attention(&query.to_device(&metal)?, &key.to_device(&metal)?, &value.to_device(&metal)?, 1)?
+                .to_device(&Device::Cpu)?;
+            let error = (actual - expected)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+            assert!(error < 0.001, "head width={width}, error={error}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn gemma4_norm_uses_weight_without_gemma3_offset() -> Result<()> {

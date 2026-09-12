@@ -361,6 +361,15 @@ impl RotatingKvCache {
         &mut self.v
     }
 
+    pub fn deep_copy_to(&self, device: &Device) -> Result<Self> {
+        let mut cache = self.clone();
+        for buffer in [&mut cache.k, &mut cache.v] {
+            buffer.all_data = buffer.all_data.as_ref()
+                .map(|tensor| tensor.to_device(device)?.copy()).transpose()?;
+        }
+        Ok(cache)
+    }
+
     pub fn k(&self) -> Result<Option<Tensor>> {
         self.k.current_data()
     }
