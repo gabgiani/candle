@@ -296,13 +296,27 @@ impl VisionAttention {
     }
 }
 
+/// Query patches whose attention scores exist at once without fused attention. A full image
+/// (~4,800 patches, 16 heads) would otherwise hold ~1.5 GB of F32 scores plus their softmax, which
+/// runs a 6 GB GPU out of memory once its caches have grown; blocks keep it near 150 MB.
+const VISION_ATTENTION_QUERY_BLOCK: usize = 512;
+
 fn vision_attention(query: &Tensor, key: &Tensor, value: &Tensor, groups: usize) -> Result<Tensor> {
     if query.device().is_metal() {
         return candle_nn::ops::sdpa(query, key, value, None, false, 1.0, 1.0);
     }
-    let key = crate::utils::repeat_kv(key.clone(), groups)?.contiguous()?;
+    let key = crate::utils::repeat_kv(key.clone(), groups)?
+        .transpose(2, 3)?
+        .contiguous()?;
     let value = crate::utils::repeat_kv(value.clone(), groups)?.contiguous()?;
-    candle_nn::ops::softmax_last_dim(&query.matmul(&key.transpose(2, 3)?)?)?.matmul(&value)
+    let patches = query.dim(2)?;
+    let mut blocks = Vec::with_capacity(patches.div_ceil(VISION_ATTENTION_QUERY_BLOCK));
+    for start in (0..patches).step_by(VISION_ATTENTION_QUERY_BLOCK) {
+        let length = (patches - start).min(VISION_ATTENTION_QUERY_BLOCK);
+        let block = query.narrow(2, start, length)?;
+        blocks.push(candle_nn::ops::softmax_last_dim(&block.matmul(&key)?)?.matmul(&value)?);
+    }
+    Tensor::cat(&blocks, 2)
 }
 
 // ── VisionMlp ───────────────────────────────────────────────────────────────
@@ -604,6 +618,25 @@ mod tests {
             let error = (actual - expected)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
             assert!(error < 0.001, "head width={width}, error={error}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn blocked_vision_attention_matches_one_pass() -> Result<()> {
+        let device = &Device::Cpu;
+        let patches = VISION_ATTENTION_QUERY_BLOCK * 2 + 37;
+        let query = (Tensor::arange(0f32, (2 * patches * 8) as f32, device)? * 0.01)?
+            .sin()?
+            .reshape((1, 2, patches, 8))?;
+        let key = (&query * 0.7)?.cos()?;
+        let value = (&query * 0.3)?.sin()?;
+        let expected = candle_nn::ops::softmax_last_dim(&query.matmul(&key.t()?)?)?.matmul(&value)?;
+        let error = (vision_attention(&query, &key, &value, 1)? - expected)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        assert!(error < 1e-5, "error={error}");
         Ok(())
     }
 
