@@ -314,7 +314,9 @@ fn default_num_threads() -> usize {
     let physical = {
         #[cfg(target_os = "macos")]
         {
-            perf_core_count().unwrap_or_else(num_cpus::get_physical)
+            // One performance core stays free: the pool's threads spin at barriers, so using
+            // every core leaves the window server no CPU and the whole Mac freezes.
+            perf_core_count().map_or_else(|| num_cpus::get_physical().saturating_sub(2), |cores| cores.saturating_sub(1))
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -377,11 +379,12 @@ pub(crate) fn candle_pool() -> &'static rayon::ThreadPool {
 }
 
 #[cfg(target_os = "macos")]
-/// Elevate the thread QoS so macOS prefers running on Performance (P) cores.
+/// Run at the "utility" QoS: macOS still prefers Performance (P) cores for it, but the
+/// window server and the apps the user is looking at keep priority over the model.
 fn set_thread_affinity() {
-    use libc::{pthread_set_qos_class_self_np, qos_class_t::QOS_CLASS_USER_INTERACTIVE};
+    use libc::{pthread_set_qos_class_self_np, qos_class_t::QOS_CLASS_UTILITY};
     unsafe {
-        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
     }
 }
 
